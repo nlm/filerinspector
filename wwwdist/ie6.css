@@ -1,0 +1,5 @@
+/* Hide this from IE6-, because it breaks it's boxes */
+div.statusOk { border-left: 3px solid #8d8; }
+div.statusWarn { border-left: 3px solid #d60; }
+div.statusCrit { border-left: 3px solid #d11; }
+div.statusOutdated { border-left: 3px solid #33f; }

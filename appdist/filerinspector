@@ -1,0 +1,2731 @@
+#! /usr/bin/perl -w
+# $Id: filerinspector-rrd.pl 93 2007-04-12 09:13:54Z tassadar $
+#BEGIN { unshift @INC, "lib" }
+
+#
+#    FilerInspector
+#    NetApp Filer Supervision and Capacity-planning tool
+#    Copyright (C) 2008-2011 Nicolas Limage <nicolas.limage@gmail.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+use strict;
+use Net::SNMP;
+use SNMP::MIB::Compiler;
+use Math::BigFloat;
+use Storable;
+
+my $OPTS;
+
+###############################################################################
+## Configuration
+
+#######################################
+## SNMP Section
+
+# Define here your snmp read-only community (usually 'public')
+$OPTS->{snmpCommunity} = 'public';
+
+# Define here the snmp timeout delay (in seconds)
+$OPTS->{snmpTimeout} = 20;
+
+# Define here a directory where compiled MIBs will be stored
+$OPTS->{mibCacheDir} = './mibcache';
+
+# Define here a list of path where mibs can be found
+$OPTS->{mibPathList} = [
+	'./mibs',
+	'/usr/share/snmp/mibs'
+];
+
+#######################################
+## Report Options
+
+# Warning and Critical disk occupation level (%)
+$OPTS->{dfWarnLevel} = 90;
+$OPTS->{dfCritLevel} = 95;
+
+# Show snapshots pseudo-volumes in agregates and volume tables ?
+$OPTS->{dfShowSnapshots} = 1;
+
+#######################################
+## HTML Section
+
+# Directory where HTML files will be put
+$OPTS->{htmlRoot} = '/var/www/htdocs/filerinspector';
+
+# Activate Auto-refresh for generated pages
+#
+# set this to the numbers of seconds between refresh
+# set this to 0 to deactivate
+# useful if you put this script in a crontab, and want your
+# browser automatically refreshed
+$OPTS->{htmlAutoRefresh} = 0;
+
+# How much time before data is considered outdated in filer index
+# Hint: the good setting for this is (2.5 * update frequency)
+$OPTS->{outdatedDelay} = 750;
+
+#######################################
+## RRDTOOL Section
+
+# The Global Master Setting to activate RRD Functionalities
+# Set it to anything other than zero to use
+$OPTS->{enableRRD} = 1;
+
+# Define here a directory where RRD data will be stored
+$OPTS->{rrdDataDir} = './data';
+
+# Warning and Critical percent _graph_ levels (cpu, disk) (%)
+$OPTS->{rrdPctWarnLevel} = 90;
+$OPTS->{rrdPctCritLevel} = 95;
+
+#######################################
+## Graphs Types
+
+# Poll and Graph aggregates and volumes (size + %) ?
+# Warning: This creates 10 graphs per aggregate + 10 graphs per volume
+$OPTS->{rrdGraphAggrVols} = 1;
+
+# Poll and Graph qtrees (size + %) ?
+# Warning: This creates 10 graphs per qtree
+$OPTS->{rrdGraphQTrees} = 0;
+
+#######################################
+## Graph Size
+
+# This controls large graphs size
+# The larger the graph, the higher the cpu usage
+# 0 = 400 px x 100 px
+# 1 = 800 px x 200 px
+$OPTS->{rrdVeryLargeGraphs} = 1;
+
+#######################################
+## Advanced Settings
+
+# Graph Consistency Point time and CP Types ?
+# If you don't know what it is, you probably don't need this
+$OPTS->{rrdGraphCP} = 1;
+
+#######################################
+## Safety Belt
+
+# Comment this line before being able to use this software
+# This is just meant to prevent troubles, since default path are
+# probably not the correct ones on your system
+#die "You must configure some options before use";
+
+# End of Configuration
+################################################################################
+
+################################################################################
+# WARNING: THIS PART CONTAINS INTERNAL PARAMETERS THAT YOU MUST NOT CHANGE
+# WARNING: THIS PART CONTAINS INTERNAL PARAMETERS THAT YOU MUST NOT CHANGE
+# WARNING: THIS PART CONTAINS INTERNAL PARAMETERS THAT YOU MUST NOT CHANGE
+
+if ($OPTS->{enableRRD})
+{
+
+$OPTS->{rrdPeriodList} = [
+	'hour',
+	'day',
+	'week',
+	'month',
+	'year',
+];
+
+$OPTS->{rrdPeriods} = {
+	'hour' => {
+		'name' => '4 Hours',
+		'gOpts' => [ '-s', 'end-250m', ],
+	},
+	'day' => {
+		'name' => 'Day',
+		'gOpts' => [ '-s', 'end-30h', ],
+	},
+	'week' => {
+		'name' => 'Week',
+		'gOpts' => [ '-s', 'end-8d', ],
+	},
+	'month' => {
+		'name' => 'Month',
+		'gOpts' => [ '-s', 'end-35d', ],
+	},
+	'year' => {
+		'name' => 'Year',
+		'gOpts' => [ '-s', 'end-400d', ],
+	},
+};
+
+$OPTS->{rrdClasses} = {
+	'pct' => {
+		'colors' => {
+			'normal' => '#66CC66',
+			'warn' => '#FCFC66',
+			'crit' => '#FC6666',
+			'line' => '#000000',
+			'peakb' => '#EEEEEE',
+			'peakl' => '#AAAAAA',
+		},
+		'ds' => [
+			'DS:val:GAUGE:600:0:U',
+		],
+		'dsFields' => 'val',
+		'vLegend' => '%',
+		'gOpts' => [
+			'-l', 0,
+			'-u', 100,
+		],
+	},
+	'netio' => {
+		'colors' => {
+			'recv' => '#CC66FF',
+			'sent' => '#66CCFF',
+			'rule' => '#666666',
+			'line' => '#000000',
+			'peakb' => '#EEEEEE',
+			'peakl' => '#AAAAAA',
+		},
+		'ds' => [
+			'DS:in:DERIVE:600:0:U',
+			'DS:out:DERIVE:600:0:U',
+		],
+		'dsFields' => 'in:out',
+		'vLegend' => 'bits/sec',
+		'gOpts' => [
+			'-b', '1000',
+		],
+	},
+	'diskio' => {
+		'colors' => {
+			'write' => '#CC66FF',
+			'read' => '#66CCFF',
+			'rule' => '#666666',
+			'line' => '#000000',
+			'peakb' => '#EEEEEE',
+			'peakl' => '#AAAAAA',
+		},
+		'ds' => [
+			'DS:in:DERIVE:600:0:U',
+			'DS:out:DERIVE:600:0:U',
+		],
+		'dsFields' => 'in:out',
+		'vLegend' => 'bytes/sec',
+		'gOpts' => [
+			'-b', '1024',
+		],
+	},
+	'ops' => {
+		'colors' => {
+			'ops' => '#66CCFF',
+			'line' => '#000000',
+			'peakb' => '#EEEEEE',
+			'peakl' => '#AAAAAA',
+		},
+		'ds' => [
+			'DS:ops:DERIVE:600:0:U',
+		],
+		'dsFields' => 'ops',
+		'vLegend' => 'ops/sec',
+		'gOpts' => [
+			'-l', '0',
+		],
+	},
+	'diskinfo' => {
+		'colors' => {
+			'total' => '#000000',
+			'active' => '#66CC66',
+			'failed' => '#FC6666',
+			'recons' => '#FCFC66',
+			'spare' => '#66CCFF',
+		},
+		'ds' => [
+			'DS:total:GAUGE:600:0:U',
+			'DS:active:GAUGE:600:0:U',
+			'DS:failed:GAUGE:600:0:U',
+			'DS:recons:GAUGE:600:0:U',
+			'DS:spare:GAUGE:600:0:U',
+		],
+		'dsFields' => 'total:active:failed:recons:spare',
+		'vLegend' => 'disk count',
+		'gOpts' => [
+			'-l', '0',
+		],
+	},
+	'volksize' => {
+		'colors' => {
+			'total' => '#66CCFF',
+			'used' => '#CC66FF',
+			'line' => '#000000',
+		},
+		'ds' => [
+			'DS:total:GAUGE:600:0:U',
+			'DS:used:GAUGE:600:0:U',
+		],
+		'dsFields' => 'total:used',
+		'vLegend' => 'bytes',
+		'gOpts' => [
+			'-l', '0',
+		],
+	},
+	'cptype' => {
+		'colors' => {
+			'total' => '#000000',
+			'timer' => '#33CC99',
+			'snap' => '#CF66CC',
+			'lowwater' => '#FCFC66',
+			'highwater' => '#339966',
+			'nvlogfull' => '#FF6633',
+			'cp' => '#6600FF',
+			'flush' => '#FC66FC',
+			'sync' => '#990066',
+		},
+		'ds' => [
+			'DS:total:DERIVE:600:0:10',
+			'DS:timer:DERIVE:600:0:10',
+			'DS:snap:DERIVE:600:0:10',
+			'DS:lowwater:DERIVE:600:0:10',
+			'DS:highwater:DERIVE:600:0:10',
+			'DS:nvlogfull:DERIVE:600:0:10',
+			'DS:cp:DERIVE:600:0:10',
+			'DS:flush:DERIVE:600:0:10',
+			'DS:sync:DERIVE:600:0:10',
+		],
+		'dsFields' => 'total:timer:snap:lowwater:highwater:nvlogfull:cp:flush:sync',
+		'vLegend' => 'CP/sec',
+		'gOpts' => [
+			'-l', '0',
+		],
+	},
+};
+
+$OPTS->{rrdOpts} = {
+	'rra' => [
+		 "RRA:AVERAGE:0.5:1:576", # resolution 5 minutes
+		 "RRA:MIN:0.5:1:576",
+		 "RRA:MAX:0.5:1:576",
+		 "RRA:AVERAGE:0.5:6:432", # 9 days, resolution 30 minutes
+		 "RRA:MIN:0.5:6:432",
+		 "RRA:MAX:0.5:6:432",
+		 "RRA:AVERAGE:0.5:24:540", # 45 days, resolution 2 hours
+		 "RRA:MIN:0.5:24:540",
+		 "RRA:MAX:0.5:24:540",
+		 "RRA:AVERAGE:0.5:288:450", # 450 days, resolution 1 day
+		 "RRA:MIN:0.5:288:450",
+		 "RRA:MAX:0.5:288:450"
+	],
+	'gOpts' => [
+		'--lazy',
+		'--interlaced',
+		'--slope-mode',
+		'-c', "SHADEA#FFFFFF",
+		'-c', "SHADEB#FFFFFF",
+		'-c', "BACK#FFFFFF",
+	],
+	'graphWidth' => 400,
+	'graphHeight' => 100,
+	'thumbWidth' => 80,
+	'thumbHeight' => 20,
+};
+
+}#if(enableRRD)
+
+# _Sub_directory of htmlRoot where images will be found
+# (you don't need to change this)
+$OPTS->{htmlImagesSubDir} = 'images';
+
+# _Sub_directory of htmlRoot where RRD graphs will be put
+$OPTS->{htmlGraphsSubDir} = 'graphs';
+
+# Default values for actions
+$OPTS->{doLargeGraphs} = 0;
+$OPTS->{doThumbGraphs} = 0;
+$OPTS->{doUpdate} = 0;
+$OPTS->{doReport} = 0;
+$OPTS->{doIndex} = 0;
+
+# Activate very large graphs
+if ($OPTS->{rrdVeryLargeGraphs})
+{
+	$OPTS->{rrdOpts}->{graphWidth} = 800;
+	$OPTS->{rrdOpts}->{graphHeight} = 200;
+}
+
+################################################################################
+# MIB Values to human-readable strings
+
+my $MIB_VALUES = {
+	'cfSettings' => [
+		undef,
+		'not licensed',
+		'enabled',
+		'disabled',
+		'takeover disabled',
+		'taken over by partner'
+	],
+	'cifsIsEnabled' => [
+		undef,
+		'false',
+		'true',
+	],
+};
+
+################################################################################
+## Misc
+
+# do not complain if RRDs is not installed
+if ($OPTS->{enableRRD}) { use RRDs; }
+
+my $finfo;
+
+################################################################################
+## System Utils
+
+# Produce a standard human readable timestamp
+# returns the date corresponding to the unix timestamp as parameter
+# if no parameter is given, returns the current date
+sub date_stamp
+{
+	my $time = (shift or time);
+	my ($sec, $min, $hour, $mday, $mon, $year) = localtime($time);
+
+	return sprintf("%02d/%02d/%04d %02d:%02d:%02d",
+		$mday, $mon + 1, $year +1900, $hour, $min, $sec);
+}
+
+# simulates mkdir -p but don't fail if dir exists
+sub mkdirif
+{
+	my $dir = shift or die;
+	my $mode = shift or die;
+
+	return 1 if (-d $dir);
+
+	$dir =~ s!/+!/!g;
+	$dir =~ s!/$!!;
+
+	$dir =~ m!^(.*/)?([^/]+)$! or die "internal error: $dir";
+	my ($base, $last) = ($1 || "", $2 || "");
+
+	if ($base && !-d $base) {
+		mkdirif($base, $mode) or die "cannot create $base: $!";
+	}
+
+	return mkdir("$base$last", $mode)
+		or die "unable to create directory $base$last: $!";
+}
+
+# _Casts_ a 32bits signed integer to a 32bits unsigned integer
+# This is to workaround negative signed integer replies instead
+# of unsigned 32bits integers
+sub to_uint32
+{
+	return unpack("L", pack("l", shift));
+}
+
+# Converts 2 32-bits signed integers to a BigFloat
+# by casting the integers to unsigned ints and
+# putting the 2 fields together
+# arg 1 are the 32 most significant bits
+# arg 2 are the 32 least significant bits
+sub bits_to_bigfloat
+{
+	return Math::BigFloat->new(to_uint32(shift))->blsft(32)->badd(to_uint32(shift));
+}
+
+# Converts 2 32-bits signed integers to a String
+# by casting the integers to unsigned ints and
+# putting the 2 fields together
+# arg 1 are the 32 most significant bits
+# arg 2 are the 32 least significant bits
+sub bits_to_bigstring
+{
+	return Math::BigInt->new(to_uint32(shift))->blsft(32)->badd(to_uint32(shift))->bstr();
+}
+
+# Pretty print for disk and volume size
+# to support new units, just add them to
+# the @units array _in the right order_
+# Math::BigFloat version
+sub b_readable_size
+{
+	my @units = ( 'KB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB' );
+	my $size = shift;
+	die if !defined($size);
+	$size = $size->copy();
+
+	my $unit = shift @units;
+
+	while (@units)
+	{
+		if ($size >= 1024)
+		{
+			$size->bdiv(1024);
+			$unit = shift @units;
+		}
+		else
+		{
+			last;
+		}
+	}
+	$size->ffround(-2);
+	return sprintf "%s %s", $size, $unit;
+}
+
+################################################################################
+## SNMP Utils
+
+sub snmp_prepare_mibs
+{
+	my $mib = new SNMP::MIB::Compiler;
+	my @mibs = ( 'SNMPv2-MIB', 'NETWORK-APPLIANCE-MIB' );
+
+	$mib->add_path($_) foreach @{$OPTS->{mibPathList}};
+	$mib->add_extension('', '.mib', '.my', '.txt');
+
+	mkdirif($OPTS->{mibCacheDir}, 0777);
+
+	$mib->{'repository'} = $OPTS->{mibCacheDir};
+	$mib->{'accept_smiv1'} = 1;
+	$mib->{'accept_smiv2'} = 1;
+
+	$mib->{'debug_recursive'} = 0;
+	$mib->{'debug_lexer'}     = 0;
+
+	$mib->{'make_dump'}  = 1;
+	$mib->{'use_dump'}   = 1;
+	$mib->{'do_imports'} = 1;
+	$mib->{'allow_underscore'} = 1;
+
+	foreach my $mibname (@mibs)
+	{
+		print "    $mibname";
+		$mib->load($mibname)
+		|| $mib->compile($mibname);
+		print ".\n";
+	}
+
+	return $mib;
+}
+
+sub snmp_new_session
+{
+	my $host = shift or die;
+	my $community = shift or die;
+
+	my ($session, $error) = Net::SNMP->session
+	(
+		-hostname  => $host,
+		-community => $community,
+		-version => '1',
+		-timeout => $OPTS->{snmpTimeout},
+		-retries => '2',
+	);
+
+	die "error creating snmp session: $error" if (!defined($session));
+	return $session;
+}
+
+sub snmp_oid
+{
+	return (shift or die)->resolve_oid(shift or die);
+}
+
+sub snmp_request
+{
+	my $session = shift or die;
+	my $key = shift or die;
+	my $result = $session->get_request(-varbindlist => ["$key"]);
+	
+	if (!defined($result)) {
+		print STDERR "[!] snmp warning: " . $session->error . " (single/$key)\n";
+	}
+
+	return $result;
+}
+
+sub snmp_mget
+{
+	my $session = shift or die;
+	my $oids = shift or die;
+
+	return $session->get_request(-varbindlist => $oids);
+}
+
+sub snmp_table
+{
+	my $session = shift or die;
+	my $key = shift or die;
+	
+	my $result = $session->get_table(-baseoid => "$key");
+
+	if (!defined($result)) {
+		print STDERR "[!] snmp warning: " . $session->error . " (table/$key)\n";
+	}
+
+	return $result;
+}
+
+sub snmp_entries
+{
+	my $session = shift or die;
+	my $array = shift or die;
+	
+	my $result = $session->get_entries(-columns => $array);
+
+	## added check to avoid warnings when no quotas are defined
+	if (!defined($result) && ($session->error !~ /are empty/)) {
+		print STDERR "[!] snmp warning: " . $session->error . "\n";
+	}
+
+	return $result;
+}
+
+################################################################################
+# Filer Utils
+
+# Returns the status of the cluster as seen in the MIB
+sub mib_value
+{
+	my $key = shift or die;
+	my $val = shift or die;
+	return $MIB_VALUES->{$key}->[$val];
+}
+
+sub get_filer_info
+{
+	my $hostname = shift or die;
+	my $mib = shift or die;
+	my $filerinfo;
+	my $volinfo;
+
+	my $session = snmp_new_session($hostname, $OPTS->{snmpCommunity});
+
+	$filerinfo->{hostName} = $hostname;
+	$filerinfo->{timeStamp} = time();
+
+	##################################################
+	## Check if filer is responding
+
+	my $oid = snmp_oid($mib, 'sysName');
+	my $result = snmp_request($session, "$oid.0");
+	die "[-] $hostname is not responding to snmp requests, skipping" if (!defined($result));
+
+	##################################################
+	## Scalar Targets
+
+	my @single_targets = (
+		'cpuBusyTimePerCent',
+		'sysUpTime',
+
+		'productVersion',
+		'productId',
+		'productModel',
+		'productFirmwareVersion',
+
+		'envFailedFanCount',
+		'envFailedFanMessage',
+		'envFailedPowerSupplyCount',
+		'envFailedPowerSupplyMessage',
+
+		'diskTotalCount',
+		'diskActiveCount',
+		'diskFailedCount',
+		'diskSpareCount',
+		'diskReconstructingCount',
+		'diskFailedMessage',
+
+		'cifsIsEnabled',
+		'cifsTotalOps',
+
+		'cfSettings',
+		'fsStatusMessage',
+		'miscGlobalStatusMessage',
+		'autosupportStatusMessage',
+	);
+
+	if ($OPTS->{enableRRD})
+	{
+		push @single_targets, (
+			'miscHighDiskReadBytes',
+			'miscLowDiskReadBytes',
+			'miscHighDiskWriteBytes',
+			'miscLowDiskWriteBytes',
+
+			'miscHighNetRcvdBytes',
+			'miscLowNetRcvdBytes',
+			'miscHighNetSentBytes',
+			'miscLowNetSentBytes',
+
+			'miscHighNfsOps',
+			'miscLowNfsOps',
+
+			'cifsTotalOps',
+			'cifsIsEnabled',
+		);
+
+		if ($OPTS->{rrdGraphCP})
+		{
+			push @single_targets, (
+				'cpFromTimerOps',
+				'cpFromSnapshotOps',
+				'cpFromLowWaterOps',
+				'cpFromHighWaterOps',
+				'cpFromLogFullOps',
+				'cpFromCpOps',
+				'cpTotalOps',
+				'cpFromFlushOps',
+				'cpFromSyncOps',
+			);
+		}
+	}
+
+	foreach my $target (@single_targets)
+	{
+		print "    $target";
+		my $oid = snmp_oid($mib, $target);
+		[ $oid ne $target ]
+			or die "error: no OID found for '$target', update your MIBs";
+		my $result = snmp_request($session, "$oid.0");
+		$filerinfo->{$target} = $result->{"$oid.0"};
+		print ".\n";
+	}
+
+	##################################################
+	# Volume Targets
+
+	my @volinfo_targets = (
+		'dfFileSys',
+
+		'dfHighTotalKBytes',
+		'dfLowTotalKBytes',
+
+		'dfHighUsedKBytes',
+		'dfLowUsedKBytes',
+
+		'dfHighAvailKBytes',
+		'dfLowAvailKBytes',
+
+		'dfPerCentKBytesCapacity',
+		'dfPerCentInodeCapacity',
+	);
+
+	foreach my $target (@volinfo_targets)
+	{
+		print "    $target";
+		my $oid = snmp_oid($mib, $target);
+		[ $oid ne $target ]
+			or die "error: no OID found for '$target', update your MIBs";
+		my @oids = ( $oid );
+		my $result = snmp_entries($session, \@oids);
+
+		for my $key (keys %$result)
+		{
+			$key =~ m/\.([0-9]+)$/
+				or die "assertion failed";
+			$volinfo->{$1}->{$target} = $result->{$key};
+			print ".";
+		}
+		print "\n";
+	}
+
+	$filerinfo->{dfEntries} = $volinfo if $volinfo;
+
+	##################################################
+	# Quota Status
+
+	if ($OPTS->{rrdGraphQTrees})
+	{
+		my $quotainfo;
+
+		# qrV2Index = foreign_key();
+		my @quotainfo_targets = (
+			'qrV2Index',
+			'qrV2PathName',
+			'qrV2Type',
+
+			'qrV2HighKBytesUsed',
+			'qrV2LowKBytesUsed',
+
+			'qrV2HighKBytesLimit',
+			'qrV2LowKBytesLimit',
+
+			'qrV2FilesUsed',
+			'qrV2FileLimit',
+
+		);
+
+		foreach my $target (@quotainfo_targets)
+		{
+			print "    $target";
+			my $oid = snmp_oid($mib, $target);
+			[ $oid ne $target ]
+				or die "error: no OID found for '$target', update your MIBs";
+			my @oids = ( $oid );
+			my $result = snmp_entries($session, \@oids);
+
+			for my $key (keys %$result)
+			{
+				$key =~ m/\.([0-9]+)\.([0-9]+)$/
+					or die "assertion failed";
+				$quotainfo->{$1}->{$2}->{$target} = $result->{$key};
+				print ".";
+			}
+			print "\n";
+		}
+
+		$filerinfo->{qrEntries} = $quotainfo if $quotainfo;
+	}
+
+	##################################################
+	# End of Session
+
+	$session->close;
+
+	return $filerinfo;
+}
+
+################################################################################
+## RRD Utils
+
+if ($OPTS->{enableRRD})
+{
+
+# returns the complete path to the rrd database file
+sub rrd_db_path
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+
+	return "$OPTS->{rrdDataDir}/${sysname}/${dbname}.rrd";
+}
+
+# returns the complete path to the rrd database directory
+sub rrd_db_dir
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+
+	return "$OPTS->{rrdDataDir}/${sysname}";
+}
+
+# returns the complete path to the graph file
+sub rrd_graph_path
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+	my $period = shift or die;
+	my $type = shift or die;
+
+	return "$OPTS->{htmlRoot}/$OPTS->{htmlGraphsSubDir}/${sysname}/${dbname}-${period}-${type}.png";
+}
+
+# returns the complete path to the graph directory
+sub rrd_graph_dir
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+
+	return "$OPTS->{htmlRoot}/$OPTS->{htmlGraphsSubDir}/${sysname}";
+}
+
+# returns the complete path to the graph file
+sub html_graph_path
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+	my $period = shift or die;
+	my $type = shift or die;
+
+	return "$OPTS->{htmlGraphsSubDir}/${sysname}/${dbname}-${period}-${type}.png";
+}
+
+
+sub rrd_valid_period
+{
+	my $period = shift or die;
+	return defined($OPTS->{rrdPeriods}->{$period});
+}
+
+sub rrd_valid_class
+{
+	my $class = shift or die;
+	return defined($OPTS->{rrdClasses}->{$class});
+}
+
+sub rrd_create_db_if_missing
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+	my $dataclass = shift or die;
+	my $fullpath = rrd_db_path($sysname, $dbname);
+	my $dbdir = rrd_db_dir($sysname, $dbname);
+
+	# Check the dataclass
+	die "invalid data class" if !rrd_valid_class($dataclass);
+
+	# File already exists
+	return 1 if -f $fullpath;
+
+	# Create directory if missing
+	if ( ! -d $dbdir )
+	{
+		mkdirif($dbdir, 0777)
+			or die "failed to create directory: $dbdir: $!";
+	}
+
+	# Now really create the database
+	RRDs::create($fullpath, @{$OPTS->{rrdClasses}->{$dataclass}->{ds}},
+		@{$OPTS->{rrdOpts}->{rra}});
+	if (my $err = RRDs::error) { die $err };
+
+	return 1;
+}
+
+sub rrd_update_db
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+	my $dataclass = shift or die;
+	my $data = shift or die; #Must be an array ref
+
+	die "internal error: not an array ref" if ref($data) ne 'ARRAY';
+	die "internal error: invalid data class" if !rrd_valid_class($dataclass);
+
+	rrd_create_db_if_missing($sysname, $dbname, $dataclass);
+
+	die "internal error: invalid number of arguments for class $dataclass"
+		if scalar(@$data) != scalar(@{$OPTS->{rrdClasses}->{$dataclass}->{ds}});
+
+	RRDs::update(rrd_db_path($sysname, $dbname),
+		'-t', $OPTS->{rrdClasses}->{$dataclass}->{dsFields},
+		'N:' . join(':', @$data));
+
+	if (my $err = RRDs::error) { die "FAIL: $sysname $dbname $dataclass / $err\n" };
+}
+
+sub rrd_graph
+{
+	my $sysname = shift or die;
+	my $dbname = shift or die;
+	my $dataclass = shift or die;
+	my $title = shift or die;
+
+	my $dbpath = rrd_db_path($sysname, $dbname);
+
+	my $graphdir = rrd_graph_dir($sysname, $dbname);
+	mkdirif($graphdir, 0777);
+
+	my $rrdDefs = {
+		'pct' => [
+			"DEF:val=${dbpath}:val:AVERAGE",
+			"DEF:valPeak=${dbpath}:val:MAX",
+			"VDEF:valMin=val,MINIMUM",
+			"VDEF:valAvg=val,AVERAGE",
+			"VDEF:valMax=val,MAXIMUM",
+			"VDEF:valLast=val,LAST",
+			"VDEF:valPeakMax=valPeak,MAXIMUM",
+			"CDEF:warn=val,$OPTS->{rrdPctWarnLevel},GE,val,UNKN,IF",
+			"CDEF:crit=val,$OPTS->{rrdPctCritLevel},GE,val,UNKN,IF",
+
+
+			"AREA:valPeak$OPTS->{rrdClasses}->{pct}->{colors}->{peakb}",
+			"LINE:valPeak$OPTS->{rrdClasses}->{pct}->{colors}->{peakl}",
+
+			"AREA:val$OPTS->{rrdClasses}->{pct}->{colors}->{normal}:normal",
+			"AREA:warn$OPTS->{rrdClasses}->{pct}->{colors}->{warn}:over $OPTS->{rrdPctWarnLevel}%",
+			"AREA:crit$OPTS->{rrdClasses}->{pct}->{colors}->{crit}:over $OPTS->{rrdPctCritLevel}%\\n",
+			"LINE:val$OPTS->{rrdClasses}->{pct}->{colors}->{line}",
+
+			"GPRINT:valMin:min\\: %.1lf%%",
+			"GPRINT:valAvg:avg\\: %.1lf%%",
+			"GPRINT:valMax:max\\: %.1lf%%",
+			"GPRINT:valPeakMax:peak\\: %.1lf%%",
+			"GPRINT:valLast:cur\\: %.1lf%%",
+		],
+		'netio' => [
+			"DEF:recv0=${dbpath}:in:AVERAGE",
+			"DEF:recvPeak0=${dbpath}:in:MAX",
+
+			# Convert bytes to bits
+			"CDEF:recv=recv0,8,*",
+			"CDEF:recvPeak=recvPeak0,8,*",
+
+			"VDEF:recvMin=recv,MINIMUM",
+			"VDEF:recvAvg=recv,AVERAGE",
+			"VDEF:recvMax=recv,MAXIMUM",
+			"VDEF:recvLast=recv,LAST",
+			"VDEF:recvPeakMax=recvPeak,MAXIMUM",
+
+			"DEF:sent0=${dbpath}:out:AVERAGE",
+			"DEF:sentPeak0=${dbpath}:out:MAX",
+
+			# Convert bytes to bits
+			"CDEF:sent=sent0,8,*",
+			"CDEF:sentPeak=sentPeak0,8,*",
+
+			"VDEF:sentMin=sent,MINIMUM",
+			"VDEF:sentAvg=sent,AVERAGE",
+			"VDEF:sentMax=sent,MAXIMUM",
+			"VDEF:sentLast=sent,LAST",
+			"VDEF:sentPeakMax=sentPeak,MAXIMUM",
+
+			"CDEF:recvGraph=0,recv,-",
+			"CDEF:recvPeakGraph=0,recvPeak,-",
+			"CDEF:sentGraph=sent",
+			"CDEF:sentPeakGraph=sentPeak",
+
+			"HRULE:0$OPTS->{rrdClasses}->{netio}->{colors}->{rule}",
+
+			"AREA:sentPeakGraph$OPTS->{rrdClasses}->{netio}->{colors}->{peakb}",
+			"LINE:sentPeakGraph$OPTS->{rrdClasses}->{netio}->{colors}->{peakl}",
+
+			"AREA:sentGraph$OPTS->{rrdClasses}->{netio}->{colors}->{sent}:sent    ",
+			"LINE:sentGraph$OPTS->{rrdClasses}->{netio}->{colors}->{line}",
+			"GPRINT:sentMin:min\\: %5.1lf%s",
+			"GPRINT:sentAvg:avg\\: %5.1lf%s",
+			"GPRINT:sentMax:max\\: %5.1lf%s",
+			"GPRINT:sentLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:recvPeakGraph$OPTS->{rrdClasses}->{netio}->{colors}->{peakb}",
+			"LINE:recvPeakGraph$OPTS->{rrdClasses}->{netio}->{colors}->{peakl}",
+
+			"AREA:recvGraph$OPTS->{rrdClasses}->{netio}->{colors}->{recv}:received",
+			"LINE:recvGraph$OPTS->{rrdClasses}->{netio}->{colors}->{line}",
+			"GPRINT:recvMin:min\\: %5.1lf%s",
+			"GPRINT:recvAvg:avg\\: %5.1lf%s",
+			"GPRINT:recvMax:max\\: %5.1lf%s",
+			"GPRINT:recvLast:cur\\: %5.1lf%s\\n",
+		],
+		'diskio' => [
+			"DEF:write=${dbpath}:in:AVERAGE",
+			"DEF:writePeak=${dbpath}:in:MAX",
+
+			"VDEF:writeMin=write,MINIMUM",
+			"VDEF:writeAvg=write,AVERAGE",
+			"VDEF:writeMax=write,MAXIMUM",
+			"VDEF:writeLast=write,LAST",
+			"VDEF:writePeakMax=writePeak,MAXIMUM",
+
+			"DEF:read=${dbpath}:out:AVERAGE",
+			"DEF:readPeak=${dbpath}:out:MAX",
+
+			"VDEF:readMin=read,MINIMUM",
+			"VDEF:readAvg=read,AVERAGE",
+			"VDEF:readMax=read,MAXIMUM",
+			"VDEF:readLast=read,LAST",
+			"VDEF:readPeakMax=readPeak,MAXIMUM",
+
+			"CDEF:writeGraph=0,write,-",
+			"CDEF:writePeakGraph=0,writePeak,-",
+			"CDEF:readGraph=read",
+			"CDEF:readPeakGraph=readPeak",
+
+			"HRULE:0$OPTS->{rrdClasses}->{diskio}->{colors}->{rule}",
+
+			"AREA:readPeakGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{peakb}",
+			"LINE:readPeakGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{peakl}",
+
+			"AREA:readGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{read}:read ",
+			"LINE:readGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{line}",
+			"GPRINT:readMin:min\\: %5.1lf%s",
+			"GPRINT:readAvg:avg\\: %5.1lf%s",
+			"GPRINT:readMax:max\\: %5.1lf%s",
+			"GPRINT:readLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:writePeakGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{peakb}",
+			"LINE:writePeakGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{peakl}",
+
+			"AREA:writeGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{write}:write",
+			"LINE:writeGraph$OPTS->{rrdClasses}->{diskio}->{colors}->{line}",
+			"GPRINT:writeMin:min\\: %5.1lf%s",
+			"GPRINT:writeAvg:avg\\: %5.1lf%s",
+			"GPRINT:writeMax:max\\: %5.1lf%s",
+			"GPRINT:writeLast:cur\\: %5.1lf%s\\n",
+		],
+		'ops' => [
+			"DEF:ops=${dbpath}:ops:AVERAGE",
+			"DEF:opsPeak=${dbpath}:ops:MAX",
+
+			"VDEF:opsMin=ops,MINIMUM",
+			"VDEF:opsAvg=ops,AVERAGE",
+			"VDEF:opsMax=ops,MAXIMUM",
+			"VDEF:opsLast=ops,LAST",
+			"VDEF:opsPeakMax=opsPeak,MAXIMUM",
+
+			"AREA:opsPeak$OPTS->{rrdClasses}->{ops}->{colors}->{peakb}",
+			"LINE:opsPeak$OPTS->{rrdClasses}->{ops}->{colors}->{peakl}",
+
+			"AREA:ops$OPTS->{rrdClasses}->{ops}->{colors}->{ops}:ops",
+			"LINE:ops$OPTS->{rrdClasses}->{ops}->{colors}->{line}",
+			"GPRINT:opsMin:min\\: %.1lf%s",
+			"GPRINT:opsAvg:avg\\: %.1lf%s",
+			"GPRINT:opsMax:max\\: %.1lf%s",
+			"GPRINT:opsPeakMax:peak\\: %.1lf%s",
+			"GPRINT:opsLast:cur\\: %.1lf%s\\n",
+		],
+		'diskinfo' => [
+			"DEF:total=${dbpath}:total:AVERAGE",
+			"DEF:active=${dbpath}:active:AVERAGE",
+			"DEF:failed=${dbpath}:failed:AVERAGE",
+			"DEF:recons=${dbpath}:recons:AVERAGE",
+			"DEF:spare=${dbpath}:spare:AVERAGE",
+
+			"VDEF:totalMin=total,MINIMUM",
+			"VDEF:totalAvg=total,AVERAGE",
+			"VDEF:totalMax=total,MAXIMUM",
+			"VDEF:totalLast=total,LAST",
+
+			"VDEF:activeMin=active,MINIMUM",
+			"VDEF:activeAvg=active,AVERAGE",
+			"VDEF:activeMax=active,MAXIMUM",
+			"VDEF:activeLast=active,LAST",
+
+			"VDEF:failedMin=failed,MINIMUM",
+			"VDEF:failedAvg=failed,AVERAGE",
+			"VDEF:failedMax=failed,MAXIMUM",
+			"VDEF:failedLast=failed,LAST",
+
+			"VDEF:reconsMin=recons,MINIMUM",
+			"VDEF:reconsAvg=recons,AVERAGE",
+			"VDEF:reconsMax=recons,MAXIMUM",
+			"VDEF:reconsLast=recons,LAST",
+
+			"VDEF:spareMin=spare,MINIMUM",
+			"VDEF:spareAvg=spare,AVERAGE",
+			"VDEF:spareMax=spare,MAXIMUM",
+			"VDEF:spareLast=spare,LAST",
+
+			"AREA:active$OPTS->{rrdClasses}->{diskinfo}->{colors}->{active}:active",
+			"AREA:spare$OPTS->{rrdClasses}->{diskinfo}->{colors}->{spare}:spares:STACK",
+			"AREA:recons$OPTS->{rrdClasses}->{diskinfo}->{colors}->{recons}:reconstructing:STACK",
+			"AREA:failed$OPTS->{rrdClasses}->{diskinfo}->{colors}->{failed}:failed:STACK",
+			"LINE:total$OPTS->{rrdClasses}->{diskinfo}->{colors}->{total}:total",
+		],
+		'volksize' => [
+			"DEF:ktotal=${dbpath}:total:AVERAGE",
+			"DEF:ktotalPeak=${dbpath}:total:MAX",
+
+			"DEF:kused=${dbpath}:used:AVERAGE",
+			"DEF:kusedPeak=${dbpath}:used:MAX",
+
+			"CDEF:gtotal=ktotal,1024,*",
+			"CDEF:gtotalPeak=ktotalPeak,1024,*",
+
+			"CDEF:gused=kused,1024,*",
+			"CDEF:gusedPeak=kusedPeak,1024,*",
+
+			"VDEF:gtotalMin=gtotal,MINIMUM",
+			"VDEF:gtotalAvg=gtotal,AVERAGE",
+			"VDEF:gtotalMax=gtotal,MAXIMUM",
+			"VDEF:gtotalLast=gtotal,LAST",
+			"VDEF:gtotalPeakMax=gtotalPeak,MAXIMUM",
+
+			"VDEF:gusedMin=gused,MINIMUM",
+			"VDEF:gusedAvg=gused,AVERAGE",
+			"VDEF:gusedMax=gused,MAXIMUM",
+			"VDEF:gusedLast=gused,LAST",
+			"VDEF:gusedPeakMax=gusedPeak,MAXIMUM",
+
+			"AREA:gtotal$OPTS->{rrdClasses}->{volksize}->{colors}->{total}:total",
+			"LINE:gtotal$OPTS->{rrdClasses}->{volksize}->{colors}->{line}",
+			"GPRINT:gtotalMin:min\\: %5.1lf%s",
+			"GPRINT:gtotalAvg:avg\\: %5.1lf%s",
+			"GPRINT:gtotalMax:max\\: %5.1lf%s",
+			"GPRINT:gtotalPeakMax:peak\\: %5.1lf%s",
+			"GPRINT:gtotalLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:gused$OPTS->{rrdClasses}->{volksize}->{colors}->{used}:used ",
+			"LINE:gused$OPTS->{rrdClasses}->{volksize}->{colors}->{line}",
+			"GPRINT:gusedMin:min\\: %5.1lf%s",
+			"GPRINT:gusedAvg:avg\\: %5.1lf%s",
+			"GPRINT:gusedMax:max\\: %5.1lf%s",
+			"GPRINT:gusedPeakMax:peak\\: %5.1lf%s",
+			"GPRINT:gusedLast:cur\\: %5.1lf%s\\n",
+		],
+		'cptype' => [
+			"DEF:total=${dbpath}:total:AVERAGE",
+			"DEF:timer=${dbpath}:timer:AVERAGE",
+			"DEF:snap=${dbpath}:snap:AVERAGE",
+			"DEF:lowwater=${dbpath}:lowwater:AVERAGE",
+			"DEF:highwater=${dbpath}:highwater:AVERAGE",
+			"DEF:nvlogfull=${dbpath}:nvlogfull:AVERAGE",
+			"DEF:cp=${dbpath}:cp:AVERAGE",
+			"DEF:flush=${dbpath}:flush:AVERAGE",
+			"DEF:sync=${dbpath}:sync:AVERAGE",
+
+			"VDEF:totalMin=total,MINIMUM",
+			"VDEF:totalAvg=total,AVERAGE",
+			"VDEF:totalMax=total,MAXIMUM",
+			"VDEF:totalLast=total,LAST",
+
+			"VDEF:timerMin=timer,MINIMUM",
+			"VDEF:timerAvg=timer,AVERAGE",
+			"VDEF:timerMax=timer,MAXIMUM",
+			"VDEF:timerLast=timer,LAST",
+
+			"VDEF:snapMin=snap,MINIMUM",
+			"VDEF:snapAvg=snap,AVERAGE",
+			"VDEF:snapMax=snap,MAXIMUM",
+			"VDEF:snapLast=snap,LAST",
+
+			"VDEF:lowwaterMin=lowwater,MINIMUM",
+			"VDEF:lowwaterAvg=lowwater,AVERAGE",
+			"VDEF:lowwaterMax=lowwater,MAXIMUM",
+			"VDEF:lowwaterLast=lowwater,LAST",
+
+			"VDEF:highwaterMin=highwater,MINIMUM",
+			"VDEF:highwaterAvg=highwater,AVERAGE",
+			"VDEF:highwaterMax=highwater,MAXIMUM",
+			"VDEF:highwaterLast=highwater,LAST",
+
+			"VDEF:nvlogfullMin=nvlogfull,MINIMUM",
+			"VDEF:nvlogfullAvg=nvlogfull,AVERAGE",
+			"VDEF:nvlogfullMax=nvlogfull,MAXIMUM",
+			"VDEF:nvlogfullLast=nvlogfull,LAST",
+
+			"VDEF:cpMin=cp,MINIMUM",
+			"VDEF:cpAvg=cp,AVERAGE",
+			"VDEF:cpMax=cp,MAXIMUM",
+			"VDEF:cpLast=cp,LAST",
+
+			"VDEF:flushMin=flush,MINIMUM",
+			"VDEF:flushAvg=flush,AVERAGE",
+			"VDEF:flushMax=flush,MAXIMUM",
+			"VDEF:flushLast=flush,LAST",
+
+			"VDEF:syncMin=sync,MINIMUM",
+			"VDEF:syncAvg=sync,AVERAGE",
+			"VDEF:syncMax=sync,MAXIMUM",
+			"VDEF:syncLast=sync,LAST",
+
+			"AREA:timer$OPTS->{rrdClasses}->{cptype}->{colors}->{timer}:timer         ",
+			"GPRINT:timerMin:min\\: %5.1lf%s",
+			"GPRINT:timerAvg:avg\\: %5.1lf%s",
+			"GPRINT:timerMax:max\\: %5.1lf%s",
+			"GPRINT:timerLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:snap$OPTS->{rrdClasses}->{cptype}->{colors}->{snap}:snap          :STACK",
+			"GPRINT:snapMin:min\\: %5.1lf%s",
+			"GPRINT:snapAvg:avg\\: %5.1lf%s",
+			"GPRINT:snapMax:max\\: %5.1lf%s",
+			"GPRINT:snapLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:lowwater$OPTS->{rrdClasses}->{cptype}->{colors}->{lowwater}:low watermark :STACK",
+			"GPRINT:lowwaterMin:min\\: %5.1lf%s",
+			"GPRINT:lowwaterAvg:avg\\: %5.1lf%s",
+			"GPRINT:lowwaterMax:max\\: %5.1lf%s",
+			"GPRINT:lowwaterLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:highwater$OPTS->{rrdClasses}->{cptype}->{colors}->{highwater}:high watermark:STACK",
+			"GPRINT:highwaterMin:min\\: %5.1lf%s",
+			"GPRINT:highwaterAvg:avg\\: %5.1lf%s",
+			"GPRINT:highwaterMax:max\\: %5.1lf%s",
+			"GPRINT:highwaterLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:nvlogfull$OPTS->{rrdClasses}->{cptype}->{colors}->{nvlogfull}:nvlog full    :STACK",
+			"GPRINT:nvlogfullMin:min\\: %5.1lf%s",
+			"GPRINT:nvlogfullAvg:avg\\: %5.1lf%s",
+			"GPRINT:nvlogfullMax:max\\: %5.1lf%s",
+			"GPRINT:nvlogfullLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:cp$OPTS->{rrdClasses}->{cptype}->{colors}->{cp}:back to back  :STACK",
+			"GPRINT:cpMin:min\\: %5.1lf%s",
+			"GPRINT:cpAvg:avg\\: %5.1lf%s",
+			"GPRINT:cpMax:max\\: %5.1lf%s",
+			"GPRINT:cpLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:flush$OPTS->{rrdClasses}->{cptype}->{colors}->{flush}:flush         :STACK",
+			"GPRINT:flushMin:min\\: %5.1lf%s",
+			"GPRINT:flushAvg:avg\\: %5.1lf%s",
+			"GPRINT:flushMax:max\\: %5.1lf%s",
+			"GPRINT:flushLast:cur\\: %5.1lf%s\\n",
+
+			"AREA:sync$OPTS->{rrdClasses}->{cptype}->{colors}->{sync}:sync          :STACK",
+			"GPRINT:syncMin:min\\: %5.1lf%s",
+			"GPRINT:syncAvg:avg\\: %5.1lf%s",
+			"GPRINT:syncMax:max\\: %5.1lf%s",
+			"GPRINT:syncLast:cur\\: %5.1lf%s\\n",
+
+			"LINE:total$OPTS->{rrdClasses}->{cptype}->{colors}->{total}:total         ",
+			"GPRINT:totalMin:min\\: %5.1lf%s",
+			"GPRINT:totalAvg:avg\\: %5.1lf%s",
+			"GPRINT:totalMax:max\\: %5.1lf%s",
+			"GPRINT:totalLast:cur\\: %5.1lf%s\\n",
+		],
+	};
+	
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		# Thumbnail Version
+		if ($OPTS->{doThumbGraphs})
+		{
+			RRDs::graph (
+				rrd_graph_path($sysname, $dbname, $period, 'thumb'),
+				'-w', $OPTS->{rrdOpts}->{thumbWidth},
+				'-h', $OPTS->{rrdOpts}->{thumbHeight},
+
+				'--only-graph',
+
+				@{$OPTS->{rrdOpts}->{gOpts}},
+				@{$OPTS->{rrdClasses}->{$dataclass}->{gOpts}},
+				@{$OPTS->{rrdPeriods}->{$period}->{gOpts}},
+				@{$rrdDefs->{$dataclass}},
+			);
+			if (my $err = RRDs::error) { die $err };
+		}
+
+		# Large Version
+		if ($OPTS->{doLargeGraphs})
+		{
+			RRDs::graph ( 
+				rrd_graph_path($sysname, $dbname, $period, 'large'),
+				'-w', $OPTS->{rrdOpts}->{graphWidth},
+				'-h', $OPTS->{rrdOpts}->{graphHeight},
+
+				'-t', "$title ($period)",
+				'-v', $OPTS->{rrdClasses}->{$dataclass}->{vLegend},
+				'-W', "last update: " . date_stamp(),
+				'-n', "LEGEND:7",
+				'-n', "TITLE:7",
+
+				@{$OPTS->{rrdOpts}->{gOpts}},
+				@{$OPTS->{rrdClasses}->{$dataclass}->{gOpts}},
+				@{$OPTS->{rrdPeriods}->{$period}->{gOpts}},
+				@{$rrdDefs->{$dataclass}},
+			);
+			if (my $err = RRDs::error) { die $err };
+		}
+	}
+}
+
+# feed the rrd databases
+sub rrd_update_dbs
+{
+	my $fi = shift or die;
+
+	######################
+	## CPU
+	print "    CPU";
+	rrd_update_db($fi->{hostName}, 'cpu', 'pct', [ $fi->{cpuBusyTimePerCent} ]);
+	print ".\n";
+
+	if ($OPTS->{rrdGraphCP})
+	{
+		print "    CPTypes";
+		rrd_update_db($fi->{hostName}, 'cptype', 'cptype', [
+			$fi->{cpTotalOps},
+			$fi->{cpFromTimerOps},
+			$fi->{cpFromSnapshotOps},
+			$fi->{cpFromLowWaterOps},
+			$fi->{cpFromHighWaterOps},
+			$fi->{cpFromLogFullOps},
+			$fi->{cpFromCpOps},
+			$fi->{cpFromFlushOps},
+			$fi->{cpFromSyncOps},
+		]);
+		print ".\n";
+	}
+
+	######################
+	# Network IO
+	print "    Network";
+	rrd_update_db($fi->{hostName}, 'network', 'netio', [
+		bits_to_bigstring($fi->{miscHighNetRcvdBytes},
+					$fi->{miscLowNetRcvdBytes}),
+		bits_to_bigstring($fi->{miscHighNetSentBytes},
+					$fi->{miscLowNetSentBytes}),
+	]);
+	print ".\n";
+
+	######################
+	## Disk IO
+	print "    DiskIO";
+	rrd_update_db($fi->{hostName}, 'disk', 'diskio', [
+		bits_to_bigstring($fi->{miscHighDiskWriteBytes},
+					$fi->{miscLowDiskWriteBytes}),
+		bits_to_bigstring($fi->{miscHighDiskReadBytes},
+					$fi->{miscLowDiskReadBytes}),
+	]);
+	print ".\n";
+
+	######################
+	## NFS Ops
+	print "    NfsOps";
+	rrd_update_db($fi->{hostName}, 'nfsops', 'ops', [
+		bits_to_bigstring($fi->{miscHighNfsOps},
+					$fi->{miscLowNfsOps})
+	]);
+	print ".\n";
+
+	######################
+	## CIFS Ops
+	if ($MIB_VALUES->{cifsIsEnabled}->[$fi->{cifsIsEnabled}] eq 'true')
+	{
+		print "    CifsOps";
+		rrd_update_db($fi->{hostName}, 'cifsops', 'ops', [
+			bits_to_bigstring(0, $fi->{cifsTotalOps})
+		]);
+		print ".\n";
+	}
+
+	######################
+	## Disk Infos
+	print "    DiskInfo";
+	rrd_update_db($fi->{hostName}, 'diskinfo', 'diskinfo', [
+		$fi->{diskTotalCount},
+		$fi->{diskActiveCount},
+		$fi->{diskFailedCount},
+		$fi->{diskReconstructingCount},
+		$fi->{diskSpareCount},
+	]);
+	print ".\n";
+
+	######################
+	## Aggregates and Volumes
+	if ($OPTS->{rrdGraphAggrVols})
+	{
+		print "    Aggregates+Volumes";
+		foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+		{
+			my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+			my $type;
+
+			if ($filesys =~ m!^/!)
+			{
+				# Volume
+				$filesys =~ m!^/vol/([a-zA-Z0-9_]+)/(\.snapshot|\.\.)?$!
+					or die "internal error (unsupported: $filesys)";
+				$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/$!$1!;
+				$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/(\.snapshot|\.\.)$!$1.snapshot!;
+				$type = 'vol';
+			}
+			else
+			{
+				$filesys =~ m!^([a-zA-Z0-9_]+)(/\.snapshot|/\.\.)?$!
+					or die "internal error (unsupported: $filesys)";
+				$filesys =~ s!^([a-zA-Z0-9_]+)(/\.snapshot|/\.\.)$!$1.snapshot!;
+				$type = 'aggr';
+			}
+
+			# Space%
+			rrd_update_db($fi->{hostName},
+				"${type}spcpct_${filesys}", 'pct',
+				[ $fi->{dfEntries}->{$key}->{dfPerCentKBytesCapacity} ]);
+
+			print ".";
+
+			# Inode%
+			rrd_update_db($fi->{hostName},
+				"${type}inopct_${filesys}", 'pct',
+				[ $fi->{dfEntries}->{$key}->{dfPerCentInodeCapacity} ]);
+
+			print ".";
+
+			# VolSize
+			rrd_update_db($fi->{hostName},
+				"${type}spcsiz_${filesys}", 'volksize',
+				[
+					bits_to_bigstring(
+						$fi->{dfEntries}->{$key}->{dfHighTotalKBytes},
+						$fi->{dfEntries}->{$key}->{dfLowTotalKBytes},
+					),
+					bits_to_bigstring(
+						$fi->{dfEntries}->{$key}->{dfHighUsedKBytes},
+						$fi->{dfEntries}->{$key}->{dfLowUsedKBytes},
+					),
+				]);
+
+			print ".";
+		}
+		print ".\n";
+	}
+
+	#########################################
+	## QTrees
+	
+	if ($OPTS->{rrdGraphQTrees})
+	{
+		print "    Qtrees";
+		foreach my $vol (sort {$a <=> $b} keys %{$fi->{qrEntries}})
+		{
+			foreach my $qt (sort {$a <=> $b} keys %{$fi->{qrEntries}->{$vol}})
+			{
+				next if ($fi->{qrEntries}->{$vol}->{$qt}->{qrV2Type} != 3);
+
+				(my $filesys = $fi->{qrEntries}->{$vol}->{$qt}->{qrV2PathName}) =~ s!/!.!g;
+
+				my $qrSpaceLimit = bits_to_bigfloat(
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2HighKBytesLimit},
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2LowKBytesLimit}
+				);
+
+				my $qrSpaceUsed = bits_to_bigfloat(
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2HighKBytesUsed},
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2LowKBytesUsed}
+				);
+
+				my $qrFilesLimit = Math::BigFloat->new(
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2FilesLimit}
+				);
+
+				my $qrFilesUsed = Math::BigFloat->new(
+					$fi->{qrEntries}->{$vol}->{$qt}->{qrV2FilesUsed}
+				);
+
+				if (!$qrSpaceLimit->is_zero())
+				{
+					rrd_update_db($fi->{hostName}, "qtrspcpct_${filesys}", 'pct',
+						[ $qrSpaceUsed->copy()->bdiv($qrSpaceLimit)->bmul(100)->ffround(0) ]);
+					print ".";
+
+					rrd_update_db($fi->{hostName}, "qtrspcsiz_${filesys}", 'volksize',
+						[ $qrSpaceLimit, $qrSpaceUsed ]);
+					print ".";
+				}
+
+				if (!$qrFilesLimit->is_zero())
+				{
+					rrd_update_db($fi->{hostName}, "qtrfilpct_${filesys}", 'pct',
+						[ $qrFilesUsed->copy()->bdiv($qrFilesLimit)->bmul(100)->ffround(0) ]);
+					print ".";
+
+					rrd_update_db($fi->{hostName}, "qtrfilsiz_${filesys}", 'volksize',
+						[ $qrFilesLimit, $qrFilesUsed ]);
+					print ".";
+				}
+
+				print ".";
+			}
+		}
+		print ".\n";
+	}
+
+	return 1;
+}
+
+sub rrd_update_graphs
+{
+	my $fi = shift or die;
+
+	print "    CPU";
+	rrd_graph($fi->{hostName}, 'cpu', 'pct', 'cpu usage');
+	print ".\n";
+
+	if ($OPTS->{rrdGraphCP})
+	{
+		print "    CPTypes";
+		rrd_graph($fi->{hostName}, 'cptype', 'cptype', 'consistency points types');
+		print ".\n";
+	}
+
+	print "    Network";
+	rrd_graph($fi->{hostName}, 'network', 'netio', 'network usage');
+	print ".\n";
+
+	print "    DiskIO";
+	rrd_graph($fi->{hostName}, 'disk', 'diskio', 'disk read/writes');
+	print ".\n";
+
+	print "    NfsOps";
+	rrd_graph($fi->{hostName}, 'nfsops', 'ops', 'nfs operations');
+	print ".\n";
+
+	if ($MIB_VALUES->{cifsIsEnabled}->[$fi->{cifsIsEnabled}] eq 'true')
+	{
+		print "    CifsOps";
+		rrd_graph($fi->{hostName}, 'cifsops', 'ops', 'cifs operations');
+		print ".\n";
+	}
+
+	print "    DiskInfo";
+	rrd_graph($fi->{hostName}, 'diskinfo', 'diskinfo', 'disk count');
+	print ".\n";
+
+	if ($OPTS->{rrdGraphAggrVols})
+	{
+		print "    Aggregates+Volumes";
+		foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+		{
+			my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+			my $type;
+
+			if ($filesys =~ m!^/!)
+			{
+				# Volume
+				$filesys =~ m!^/vol/([a-zA-Z0-9_]+)/(\.snapshot|\.\.)?$!
+					or die "internal error";
+				$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/$!$1!;
+				$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/(\.snapshot|\.\.)$!$1.snapshot!;
+				$type = 'vol';
+			}
+			else
+			{
+				$filesys =~ m!^([a-zA-Z0-9_]+)(/\.snapshot|/\.\.)?$!
+					or die "internal error";
+				$filesys =~ s!^([a-zA-Z0-9_]+)(/\.snapshot|/\.\.)$!$1.snapshot!;
+				$type = 'aggr';
+			}
+
+			rrd_graph($fi->{hostName}, "${type}spcpct_${filesys}", 'pct', "$fi->{hostName} ${filesys} space usage");
+			print ".";
+			rrd_graph($fi->{hostName}, "${type}inopct_${filesys}", 'pct', "$fi->{hostName} ${filesys} inodes usage");
+			print ".";
+			rrd_graph($fi->{hostName}, "${type}spcsiz_${filesys}", 'volksize', "$fi->{hostName} ${filesys} volume size");
+			print ".";
+		}
+		print ".\n";
+	}
+
+	if ($OPTS->{rrdGraphQTrees})
+	{
+		print "    Qtrees";
+		foreach my $vol (sort {$a <=> $b} keys %{$fi->{qrEntries}})
+		{
+			foreach my $qt (sort {$a <=> $b} keys %{$fi->{qrEntries}->{$vol}})
+			{
+				next if ($fi->{qrEntries}->{$vol}->{$qt}->{qrV2Type} != 3);
+
+				(my $filesys = $fi->{qrEntries}->{$vol}->{$qt}->{qrV2PathName}) =~ s!/!.!g;
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrspcpct_${filesys}"))
+				{
+					rrd_graph($fi->{hostName}, "qtrspcpct_${filesys}", 'pct',
+						"$fi->{hostName}:${filesys} space usage");
+					print ".";
+				}
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrspcsiz_${filesys}"))
+				{
+					rrd_graph($fi->{hostName}, "qtrspcsiz_${filesys}", 'volksize',
+						"${filesys} volume size");
+					print ".";
+				}
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrfilpct_${filesys}"))
+				{
+					rrd_graph($fi->{hostName}, "qtrfilpct_${filesys}", 'pct',
+						"$fi->{hostName}:${filesys} space usage");
+					print ".";
+				}
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrfilsiz_${filesys}"))
+				{
+					rrd_graph($fi->{hostName}, "qtrfilsiz_${filesys}", 'volksize',
+						"${filesys} volume size");
+					print ".";
+				}
+
+				print ".";
+			}
+		}
+		print ".\n";
+	}
+
+	return 1;
+}
+
+}#if(enableRRD)
+
+################################################################################
+## HTML Utils
+
+sub html_df_gauge
+{
+	my $data = shift;
+	die if !defined $data;
+	my $code = "";
+
+	my $level = ($data > 100) ? 100 : $data;
+	$code .= '<div class="dfGauge">';
+	$code .= '<div class="';
+	if ($data >= $OPTS->{dfCritLevel})
+	{
+		$code .= 'dfGaugeCrit';
+	}
+	elsif ($data >= $OPTS->{dfWarnLevel})
+	{
+		$code .= 'dfGaugeWarn';
+	}
+	else
+	{
+		$code .= 'dfGaugeOk';
+	}
+	$code .= '" style="width:';
+	$code .= $level;
+	$code .= '%">';
+	$code .= $data;
+	$code .= '%</div></div>';
+	return $code;
+}
+
+sub print_html_filer_report
+{
+	# FileHandle
+	my $fh = shift or die;
+	# FilerInfo
+	my $fi = shift or die;
+	my $tidx;
+
+	print $fh <<EOT
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+ "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="fr">
+<head><title>FilerInspector Report for $fi->{hostName}</title>
+<meta http-equiv="Content-Type" content="text/HTML; charset=iso-8859-1" />
+EOT
+	;
+
+	if ($OPTS->{htmlAutoRefresh} > 0)
+	{
+		printf $fh "<meta http-equiv=\"refresh\" content=\"%s\" />\n",
+			$OPTS->{htmlAutoRefresh};
+	}
+
+	print $fh <<EOT
+<link rel="stylesheet" type="text/css" href="style.css" media="all" />
+<!--[if lt IE 7]>
+<link rel="stylesheer" type="text/css" href="ie6.css" media="all" />
+<![endif]-->
+<link rel="stylesheet" type="text/css" href="print.css" media="print" />
+</head><body>
+EOT
+	;
+
+	print $fh "<div id=\"report\">";
+#		((time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? " style=\"border: .5em solid #666\"" : "" ) . ">";
+	print $fh "<div id=\"model\">";
+	print $fh "<a href=\"index.html\">";
+	print $fh "<img src=\"$OPTS->{htmlImagesSubDir}/$fi->{productModel}.jpg\" alt=\"$fi->{productModel}\" />";
+	print $fh "</a>";
+	print $fh "</div>";
+
+	print $fh "<div id=\"title\">";
+	print $fh "<p>FilerInspector report for</p>";
+	print $fh "<h1>$fi->{hostName}</h1>";
+	## Last Update
+	printf $fh "<p>data update: %s</p>\n", date_stamp($fi->{timeStamp});
+	printf $fh "<p>page update: %s</p>\n", date_stamp();
+	print $fh "</div>";
+	
+	print $fh "<div id=\"spacer\">&nbsp;</div>\n";
+
+	####################################
+	## Global Status
+	print "    Global Status";
+	print $fh "<h2>Global Status</h2>\n";
+
+	## Status
+	$fi->{miscGlobalStatusMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	$fi->{miscGlobalStatusMessage} =~ s/%/%%/g;
+	printf $fh "<div class=\"%s\"><p>$fi->{miscGlobalStatusMessage}</p></div>\n",
+		($fi->{miscGlobalStatusMessage} =~ /global status is normal/) ? "statusOk" : "statusCrit";
+
+	## AutoSupport
+	$fi->{autosupportStatusMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	printf $fh "<div class=\"%s\"><p>$fi->{autosupportStatusMessage}</p></div>\n",
+		($fi->{autosupportStatusMessage} =~ /successfully/) ? "statusOk" : "statusWarn";
+
+	## CPU
+	printf $fh "<div class=\"%s\"><p>CPU is %s%% busy</p></div>\n",
+		($fi->{cpuBusyTimePerCent} > $OPTS->{rrdPctCritLevel}) ? "statusCrit" :
+		($fi->{cpuBusyTimePerCent} > $OPTS->{rrdPctWarnLevel}) ? "statusWarn" :
+		"statusOk", $fi->{cpuBusyTimePerCent};
+
+	## Details
+	print $fh <<EOT
+<table class="info" id="globalinfo">
+<tr><th>Filer Model</th><td>$fi->{productModel}</td>
+<th>Product ID</th><td>$fi->{productId}</td></tr>
+<tr><th>Software Version</th><td>$fi->{productVersion}</td>
+<th>Firmware Version</th><td>$fi->{productFirmwareVersion}</td></tr>
+<tr><th>Uptime</th><td>$fi->{sysUpTime}</td>
+EOT
+	;
+	printf $fh "<th>Cluster Status</th><td>%s</td>\n", mib_value('cfSettings', $fi->{cfSettings});
+	print $fh "</tr></table>\n";
+
+if ($OPTS->{enableRRD})
+{
+	####################################
+	## CPU, Network, IO
+
+	print $fh "<h2>CPU, Network, Disk IO Graphs</h2>\n";
+	print $fh "<table class=\"info\" id=\"graphinfo\">\n<tr><th></th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<th class=\"period\">$OPTS->{rrdPeriods}->{$period}->{name}</th>";
+	}
+
+	# CPU
+	print $fh "</tr>\n";
+	print $fh "<tr><th class=\"gtitle\">CPU</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<td class=\"gcell\">";
+		printf $fh "<a href=\"%s\">",
+			html_graph_path($fi->{hostName}, 'cpu', $period, 'large');
+		printf $fh "<img src=\"%s\" alt=\"cpu-%s\" class=\"graphthumb\" />",
+			html_graph_path($fi->{hostName}, 'cpu', $period, 'thumb'), $period;
+		print $fh "</a>";
+		print $fh "<div class=\"popgraph\">";
+		printf $fh "<img src=\"%s\" alt=\"cpu-%s\" class=\"graphlarge\" />",
+			html_graph_path($fi->{hostName}, 'cpu', $period, 'large'), $period;
+		print $fh "</div>";
+		print $fh "</td>\n";
+	}
+	print $fh "</tr>\n";
+
+	if ($OPTS->{rrdGraphCP})
+	{
+		# CP Time
+#		print $fh "</tr>\n";
+#		print $fh "<tr><th class=\"gtitle\">CP Time</th>";
+#		foreach my $period (@{$OPTS->{rrdPeriodList}})
+#		{
+#			print $fh "<td class=\"gcell\">";
+#			printf $fh "<a href=\"%s\">",
+#				html_graph_path($fi->{hostName}, 'cptime', $period, 'large');
+#			printf $fh "<img src=\"%s\" alt=\"cptime-%s\" class=\"graphthumb\" />",
+#				html_graph_path($fi->{hostName}, 'cptime', $period, 'thumb'), $period;
+#			print $fh "</a>";
+#			print $fh "<div class=\"popgraph\">";
+#			printf $fh "<img src=\"%s\" alt=\"cptime-%s\" class=\"graphlarge\" />",
+#				html_graph_path($fi->{hostName}, 'cptime', $period, 'large'), $period;
+#			print $fh "</div>";
+#			print $fh "</td>\n";
+#		}
+#		print $fh "</tr>\n";
+
+		# CP Types
+		print $fh "<tr><th class=\"gtitle\">Consistency Points</th>";
+		foreach my $period (@{$OPTS->{rrdPeriodList}})
+		{
+			print $fh "<td class=\"gcell\">";
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, 'cptype', $period, 'large');
+			printf $fh "<img src=\"%s\" alt=\"cptype-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, 'cptype', $period, 'thumb'), $period;
+			print $fh "</a>";
+			print $fh "<div class=\"popgraph\">";
+			printf $fh "<img src=\"%s\" alt=\"cptype-%s\" class=\"graphlarge\" />",
+				html_graph_path($fi->{hostName}, 'cptype', $period, 'large'), $period;
+			print $fh "</div>";
+			print $fh "</td>\n";
+		}
+		print $fh "</tr>\n";
+	}
+
+	# Network
+	print $fh "<tr><th class=\"gtitle\">Network</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<td class=\"gcell\">";
+		printf $fh "<a href=\"%s\">",
+			html_graph_path($fi->{hostName}, 'network', $period, 'large');
+		printf $fh "<img src=\"%s\" alt=\"network-%s\" class=\"graphthumb\" />",
+			html_graph_path($fi->{hostName}, 'network', $period, 'thumb'), $period;
+		print $fh "</a>";
+		print $fh "<div class=\"popgraph\">";
+		printf $fh "<img src=\"%s\" alt=\"network-%s\" class=\"graphlarge\" />",
+			html_graph_path($fi->{hostName}, 'network', $period, 'large'), $period;
+		print $fh "</div>";
+		print $fh "</td>\n";
+	}
+	print $fh "</tr>\n";
+
+	# Disks IO
+	print $fh "<tr><th class=\"gtitle\">Disks Read/Write</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<td class=\"gcell\">";
+		printf $fh "<a href=\"%s\">",
+			html_graph_path($fi->{hostName}, 'disk', $period, 'large');
+		printf $fh "<img src=\"%s\" alt=\"disk-%s\" class=\"graphthumb\" />",
+			html_graph_path($fi->{hostName}, 'disk', $period, 'thumb'),
+			$period;
+		print $fh "</a>";
+		print $fh "<div class=\"popgraph\">";
+		printf $fh "<img src=\"%s\" alt=\"disk-%s\" class=\"graphlarge\" />",
+			html_graph_path($fi->{hostName}, 'disk', $period, 'large'), $period;
+		print $fh "</div>";
+		print $fh "</td>\n";
+	}
+	print $fh "</tr>\n";
+
+	# NFS Ops
+	print $fh "<tr><th class=\"gtitle\">NFS Operations</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<td class=\"gcell\">";
+		printf $fh "<a href=\"%s\">",
+			html_graph_path($fi->{hostName}, 'nfsops', $period, 'large');
+		printf $fh "<img src=\"%s\" alt=\"nfsops-%s\" class=\"graphthumb\" />",
+			html_graph_path($fi->{hostName}, 'nfsops', $period, 'thumb'),
+			$period;
+		print $fh "</a>";
+		print $fh "<div class=\"popgraph\">";
+		printf $fh "<img src=\"%s\" alt=\"nfsops-%s\" class=\"graphlarge\" />",
+			html_graph_path($fi->{hostName}, 'nfsops', $period, 'large'),
+			$period;
+		print $fh "</div>";
+		print $fh "</td>\n";
+	}
+	print $fh "</tr>\n";
+
+	if ($MIB_VALUES->{cifsIsEnabled}->[$fi->{cifsIsEnabled}] eq 'true')
+	{
+		# CIFS Ops
+		print $fh "<tr><th class=\"gtitle\">CIFS Operations</th>";
+		foreach my $period (@{$OPTS->{rrdPeriodList}})
+		{
+			print $fh "<td class=\"gcell\">";
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, 'cifsops', $period, 'large');
+			printf $fh "<img src=\"%s\" alt=\"cifsops-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, 'cifsops', $period, 'thumb'),
+				$period;
+			print $fh "</a>";
+			print $fh "<div class=\"popgraph\">";
+			printf $fh "<img src=\"%s\" alt=\"cifsops-%s\" class=\"graphlarge\" />",
+				html_graph_path($fi->{hostName}, 'cifsops', $period, 'large'),
+				$period;
+			print $fh "</div>";
+			print $fh "</td>\n";
+		}
+		print $fh "</tr>\n";
+	}
+
+	print $fh "</table>\n";
+}#if(enableRRD)
+	
+	####################################
+	## Hardware Status
+	print ".\n    Hardware Status";
+	print $fh "<h2>Hardware Informations</h2>\n";
+
+	## Fans
+	$fi->{envFailedFanMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	printf $fh "<div class=\"%s\"><p>$fi->{envFailedFanMessage}</p></div>\n",
+		($fi->{envFailedFanMessage} =~ /no failed fans/) ? "statusOk" : "statusCrit";
+
+	## Power Supplies
+	$fi->{envFailedPowerSupplyMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	printf $fh "<div class=\"%s\"><p>$fi->{envFailedPowerSupplyMessage}</p></div>",
+		($fi->{envFailedPowerSupplyMessage} =~ /no failed power supplies/) ? "statusOk" : "statusCrit";
+
+	####################################
+	## Disk Informations
+	print ".\n    Disks";
+	print $fh "<h2>Disk Informations</h2>";
+
+	## Status
+	$fi->{diskFailedMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	printf $fh "<div class=\"%s\"><p>$fi->{diskFailedMessage}</p></div>\n",
+		($fi->{diskFailedMessage} =~ /no failed disks/) ? "statusOk" : "statusCrit";
+
+	## Details
+	print $fh <<EOT
+<table class="info" id="diskinfo">
+<tr class="r0"><th>Total Disks</th><td>$fi->{diskTotalCount}</td></tr>
+<tr class="r1"><th>Active Disks</th><td>$fi->{diskActiveCount}</td></tr>
+<tr class="r0"><th>Failed Disks</th><td>$fi->{diskFailedCount}</td></tr>
+<tr class="r1"><th>Reconstructing Disks</th><td>$fi->{diskReconstructingCount}</td></tr>
+<tr class="r0"><th>Spare Disks</th><td>$fi->{diskSpareCount}</td></tr>
+</table>
+EOT
+	;
+	
+if ($OPTS->{enableRRD})
+{
+	#######################################################################
+	## Disk Count Graph
+	print $fh "<table class=\"info\" id=\"diskginfo\"><tr><th></th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<th class=\"period\">$OPTS->{rrdPeriods}->{$period}->{name}</th>";
+	}
+	print $fh "</tr>";
+
+	print $fh "<tr><th class=\"gtitle\">Disk Count</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print $fh "<td class=\"gcell\">";
+		printf $fh "<a href=\"%s\">",
+			html_graph_path($fi->{hostName}, 'diskinfo', $period, 'large');
+		printf $fh "<img src=\"%s\" alt=\"diskinfo-%s\" class=\"graphthumb\" />",
+			html_graph_path($fi->{hostName}, 'diskinfo', $period, 'thumb'),
+			$period;
+		print $fh "</a>";
+		print $fh "<div class=\"popgraph\">";
+		printf $fh "<img src=\"%s\" alt=\"diskinfo-%s\" class=\"graphlarge\" />",
+			html_graph_path($fi->{hostName}, 'diskinfo', $period, 'large'),
+			$period;
+		print $fh "</div>";
+		print $fh "</td>\n";
+	}
+
+	print $fh "</tr>\n";
+	print $fh "</table>";
+}#if(enableRRD)
+
+	####################################
+	## Volume Global Status
+	print $fh "<h2>Volume Informations</h2>\n";
+
+	## Status
+	$fi->{fsStatusMessage} =~ s/(\S\.)\s/$1<br \/>/g;
+	$fi->{fsStatusMessage} =~ s/%/%%/g;
+	printf $fh "<div class=\"%s\">$fi->{fsStatusMessage}</div>\n",
+		(($fi->{fsStatusMessage} =~ /All volumes have adequate space/) ? "statusOk" : 
+			(($fi->{fsStatusMessage} =~ / nearly full /) ? "statusWarn" : "statusCrit"));
+
+	####################################
+	## Aggregates Details
+	print $fh "<h3>Aggregates</h3>\n";
+	print $fh "<table class=\"info\" id=\"aggrtable\">\n";
+	print $fh "<tr>";
+	print $fh "<th class=\"dfFileSys\">Aggregate Name</th>";
+	print $fh "<th class=\"dfTotalKBytes\">Total&nbsp;Space</th>";
+	print $fh "<th class=\"dfUsedKBytes\">Used&nbsp;Space</th>";
+	print $fh "<th class=\"dfAvailKBytes\">Available&nbsp;Space</th>";
+	print $fh "<th class=\"dfGauge\">Inodes%</th>";
+	print $fh "<th class=\"dfGauge\">Space%</th>";
+	print $fh "</tr>\n";
+
+	print ".\n    Aggregates";
+
+	$tidx = 0;
+	foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+	{
+		my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+
+		# Filter in aggregates
+		$filesys =~ m/^\// && next;
+		$filesys =~ s!^([a-zA-Z0-9_]+)/\.snapshot$!$1.snapshot!;
+
+		# Filter out snapshots
+		if (!$OPTS->{dfShowSnapshots}) { $filesys =~ m/\.snapshot$/ && next; }
+
+		printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+		print $fh "<td class=\"dfFileSys\">$fi->{dfEntries}->{$key}->{dfFileSys}</td>";
+		# Total
+		printf $fh "<td class=\"dfTotalKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighTotalKBytes},
+					$fi->{dfEntries}->{$key}->{dfLowTotalKBytes}));
+		# Used
+		printf $fh "<td class=\"dfUsedKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighUsedKBytes},
+					$fi->{dfEntries}->{$key}->{dfLowUsedKBytes}));
+		# Free
+		printf $fh "<td class=\"dfAvailKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighAvailKBytes},
+				$fi->{dfEntries}->{$key}->{dfLowAvailKBytes}));
+
+		printf $fh "<td class=\"dfGauge\">%s</td>",
+			html_df_gauge($fi->{dfEntries}->{$key}->{dfPerCentInodeCapacity});
+
+		printf $fh "<td class=\"dfGauge\">%s</td>",
+			html_df_gauge($fi->{dfEntries}->{$key}->{dfPerCentKBytesCapacity});
+
+		print $fh "</tr>\n";
+
+		print ".";
+	}
+
+	print $fh "</table>\n";
+
+	print ".\n";
+
+if ($OPTS->{enableRRD})
+{
+	#######################################################################
+	## Aggregates Graph Table
+
+	print "    AggregatesGraphs";
+
+	print $fh "<table class=\"info\" id=\"aggrginfo\">\n<tr>";
+	print $fh "<th>Aggregate Name</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print ".";
+		print $fh "<th class=\"period\">$OPTS->{rrdPeriods}->{$period}->{name}</th>";
+	}
+	print $fh "</tr>\n";
+
+	$tidx = 0;
+	foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+	{
+		my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+
+		# Filter in aggregates
+		$filesys =~ m/^\// && next;
+		$filesys =~ s!^([a-zA-Z0-9_]+)/\.snapshot$!$1.snapshot!;
+
+		# Filter out snapshots
+		if (!$OPTS->{dfShowSnapshots}) { $filesys =~ m/\.snapshot$/ && next; }
+
+		printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+
+		# Aggregates
+		print $fh "<td class=\"dfFileSys\">$filesys</td>";
+		foreach my $period (@{$OPTS->{rrdPeriodList}})
+		{
+			print $fh "<td class=\"gcell\">";
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, "aggrspcpct_$filesys", $period, 'large'),
+				$period;
+			printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, "aggrspcpct_$filesys", $period, 'thumb'),
+				$period;
+			print $fh "</a>";
+			print $fh "<br />";
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, "aggrspcsiz_$filesys", $period, 'large'),
+				$period;
+			printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, "aggrspcsiz_$filesys", $period, 'thumb'),
+				$period;
+			print $fh "</a>";
+			print $fh "</td>\n";
+		}
+		print $fh "</tr>\n";
+		print ".";
+	}
+
+	print $fh "</table>";
+
+	print ".\n";
+}#if(enableRRD)
+
+	#######################################################################
+	## Volumes Details
+	print $fh "<h3>Volumes</h3>\n";
+	print $fh "<table class=\"info\" id=\"voltable\">\n";
+	print $fh "<tr>";
+	print $fh "<th class=\"dfFileSys\">Volume&nbsp;Name</th>";
+	print $fh "<th class=\"dfTotalKBytes\">Total&nbsp;Space</th>";
+	print $fh "<th class=\"dfUsedKBytes\">Used&nbsp;Space</th>";
+	print $fh "<th class=\"dfAvailKBytes\">Available&nbsp;Space</th>";
+	print $fh "<th class=\"dfGauge\">Inodes%</th>";
+	print $fh "<th class=\"dfGauge\">Space%</th>";
+	print $fh "</tr>\n";
+
+	print "    Volumes";
+
+	$tidx = 0;
+	foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+	{
+		my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+
+		# Filter out aggregates
+		$filesys !~ m/^\// && next;
+		$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/$!$1!;
+		$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/\.snapshot$!$1.snapshot!;
+		# Filter out snapshots
+		if (!$OPTS->{dfShowSnapshots}) {
+			$filesys =~ m/\.snapshot$/ && next;
+			$filesys =~ m!/\.\.$! && next;
+		}
+		printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+		print $fh "<td class=\"dfFileSys\">$filesys</td>";
+		# Total
+		printf $fh "<td class=\"dfTotalKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighTotalKBytes},
+				$fi->{dfEntries}->{$key}->{dfLowTotalKBytes}));
+		# Used
+		printf $fh "<td class=\"dfUsedKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighUsedKBytes},
+				$fi->{dfEntries}->{$key}->{dfLowUsedKBytes}));
+		# Free
+		printf $fh "<td class=\"dfAvailKBytes\">%s</td>",
+			b_readable_size(bits_to_bigfloat($fi->{dfEntries}->{$key}->{dfHighAvailKBytes},
+				$fi->{dfEntries}->{$key}->{dfLowAvailKBytes}));
+
+		printf $fh "<td class=\"dfGauge\">%s</td>",
+			html_df_gauge($fi->{dfEntries}->{$key}->{dfPerCentInodeCapacity});
+
+		printf $fh "<td class=\"dfGauge\">%s</td>",
+			html_df_gauge($fi->{dfEntries}->{$key}->{dfPerCentKBytesCapacity});
+
+		print $fh "</tr>\n";
+
+		print ".";
+	}
+
+	print $fh "</table>\n";
+	print ".\n";
+
+if ($OPTS->{enableRRD} && $OPTS->{rrdGraphAggrVols})
+{
+	#######################################################################
+	## Volume Graph Table
+
+	print "    VolumesGraphs";
+
+	print $fh "<table class=\"info\" id=\"volginfo\">\n<tr>";
+	print $fh "<th>Volume Name</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print ".";
+		print $fh "<th class=\"period\">$OPTS->{rrdPeriods}->{$period}->{name}</th>";
+	}
+	print $fh "</tr>\n";
+
+	$tidx = 0;
+	foreach my $key (sort {$a <=> $b} keys %{$fi->{dfEntries}})
+	{
+		my $filesys = $fi->{dfEntries}->{$key}->{dfFileSys};
+
+		# Filter out aggregates
+		$filesys !~ m/^\// && next;
+		$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/$!$1!;
+		$filesys =~ s!^/vol/([a-zA-Z0-9_]+)/\.snapshot$!$1.snapshot!;
+		# Filter out snapshots
+		if (!$OPTS->{dfShowSnapshots}) {
+			$filesys =~ m/\.snapshot$/ && next;
+			$filesys =~ m!/\.\.$! && next;
+		}
+		printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+
+		# Volumes
+		print $fh "<td class=\"dfFileSys\">$filesys</td>";
+		foreach my $period (@{$OPTS->{rrdPeriodList}})
+		{
+			print $fh "<td class=\"gcell\">";
+
+			# %Space
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, "volspcpct_$filesys", $period, 'large'),
+				$period;
+			printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, "volspcpct_$filesys", $period, 'thumb'),
+				$period;
+			print $fh "</a>";
+
+			print $fh "<br />";
+
+			# Size
+			printf $fh "<a href=\"%s\">",
+				html_graph_path($fi->{hostName}, "volspcsiz_$filesys", $period, 'large'),
+				$period;
+			printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+				html_graph_path($fi->{hostName}, "volspcsiz_$filesys", $period, 'thumb'),
+				$period;
+			print $fh "</a>";
+			print $fh "</td>\n";
+		}
+		print $fh "</tr>\n";
+		print ".";
+	}
+	print $fh "</table>";
+	print ".\n";
+}#if(enableRRD)
+
+	#######################################################################
+	## Qtree Details
+	print $fh "<h3>QTrees</h3>\n";
+	print $fh "<table class=\"info\" id=\"qtreetable\">\n";
+	print $fh "<tr>";
+	print $fh "<th class=\"dfFileSys\">QTree&nbsp;Path</th>";
+	print $fh "<th class=\"dfTotalKBytes\">Quota&nbsp;Limit</th>";
+	print $fh "<th class=\"dfUsedKBytes\">Used&nbsp;Space</th>";
+	print $fh "<th class=\"dfAvailKBytes\">Remaining</th>";
+	print $fh "<th class=\"dfGauge\">Files%</th>";
+	print $fh "<th class=\"dfGauge\">Space%</th>";
+	print $fh "</tr>\n";
+
+	print "    QTrees";
+
+	$tidx = 0;
+	foreach my $vol (sort {$a <=> $b} keys %{$fi->{qrEntries}})
+	{
+		foreach my $qt (sort {$a <=> $b} keys %{$fi->{qrEntries}->{$vol}})
+		{
+			next if ($fi->{qrEntries}->{$vol}->{$qt}->{qrV2Type} != 3);
+			my $qrSpaceLimit = bits_to_bigfloat(
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2HighKBytesLimit},
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2LowKBytesLimit}
+			);
+
+			my $qrSpaceUsed = bits_to_bigfloat(
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2HighKBytesUsed},
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2LowKBytesUsed}
+			);
+
+			my $qrFilesLimit = Math::BigFloat->new(
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2FilesLimit}
+			);
+
+			my $qrFilesUsed = Math::BigFloat->new(
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2FilesUsed}
+			);
+
+			printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+			printf $fh "<td class=\"dfFileSys\">%s</td>",
+				$fi->{qrEntries}->{$vol}->{$qt}->{qrV2PathName};
+
+			# Total
+			printf $fh "<td class=\"dfTotalKBytes\">%s</td>",
+				b_readable_size($qrSpaceLimit);
+
+			# Used
+			printf $fh "<td class=\"dfUsedKBytes\">%s</td>",
+				b_readable_size($qrSpaceUsed);
+
+			# Free
+			if ($qrSpaceLimit->is_zero())
+			{
+				printf $fh "<td class=\"dfAvailKBytes\">%s</td>",
+					"unlimited";
+			}
+			else
+			{
+				printf $fh "<td class=\"dfAvailKBytes\">%s</td>",
+					b_readable_size($qrSpaceLimit->copy()->bsub($qrSpaceUsed));
+			}
+
+			if ($qrFilesLimit->is_zero())
+			{
+				printf $fh "<td class=\"dfGauge\">%s</td>",
+					"unlimited";
+			}
+			else
+			{
+				printf $fh "<td class=\"dfGauge\">%s</td>",
+					html_df_gauge($qrFilesUsed->copy()->bdiv($qrFilesLimit)->bmul(100)->ffround(0));
+			}
+
+			if ($qrSpaceLimit->is_zero())
+			{
+				printf $fh "<td class=\"dfGauge\">%s</td>",
+					"unlimited";
+			}
+			else
+			{
+				printf $fh "<td class=\"dfGauge\">%s</td>",
+					html_df_gauge($qrSpaceUsed->copy()->bdiv($qrSpaceLimit)->bmul(100)->ffround(0));
+			}
+
+			print $fh "</tr>\n";
+
+			print ".";
+		}
+	}
+	print $fh "</table>\n";
+	print ".\n";
+
+if ($OPTS->{enableRRD} && $OPTS->{rrdGraphQTrees})
+{
+	#####################################
+	# Qtree Graph Table
+
+	print "    QtreeGraphs";
+
+	print $fh "<table class=\"info\" id=\"qtrginfo\">\n<tr>";
+	print $fh "<th>Qtree Path</th>";
+	foreach my $period (@{$OPTS->{rrdPeriodList}})
+	{
+		print ".";
+		print $fh "<th class=\"period\">$OPTS->{rrdPeriods}->{$period}->{name}</th>";
+	}
+	print $fh "</tr>\n";
+
+	$tidx = 0;
+	foreach my $vol (sort {$a <=> $b} keys %{$fi->{qrEntries}})
+	{
+		foreach my $qt (sort {$a <=> $b} keys %{$fi->{qrEntries}->{$vol}})
+		{
+			next if ($fi->{qrEntries}->{$vol}->{$qt}->{qrV2Type} != 3);
+
+			(my $filesys = $fi->{qrEntries}->{$vol}->{$qt}->{qrV2PathName}) =~ s!/!.!g;
+
+			printf $fh "<tr class=\"r%s\">", $tidx++ % 2;
+			printf $fh "<td class=\"dfFileSys\">%s</td>",
+			$fi->{qrEntries}->{$vol}->{$qt}->{qrV2PathName};
+
+			foreach my $period (@{$OPTS->{rrdPeriodList}})
+			{
+				print $fh "<td class=\"gcell\">";
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrspcpct_${filesys}"))
+				{
+					# %Space
+					printf $fh "<a href=\"%s\">",
+						html_graph_path($fi->{hostName}, "qtrspcpct_$filesys", $period, 'large'),
+						$period;
+					printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+						html_graph_path($fi->{hostName}, "qtrspcpct_$filesys", $period, 'thumb'),
+						$period;
+					print $fh "</a>";
+
+					print $fh "<br />";
+				}
+
+				if (-f rrd_db_path($fi->{hostName}, "qtrspcsiz_${filesys}"))
+				{
+					# Size
+					printf $fh "<a href=\"%s\">",
+						html_graph_path($fi->{hostName}, "qtrspcsiz_$filesys", $period, 'large'),
+						$period;
+					printf $fh "<img src=\"%s\" alt=\"$filesys-%s\" class=\"graphthumb\" />",
+						html_graph_path($fi->{hostName}, "qtrspcsiz_$filesys", $period, 'thumb'),
+						$period;
+					print $fh "</a>";
+
+					print $fh "<br />";
+				}
+
+				print $fh "</td>";
+
+			}
+			print $fh "</tr>\n";
+			print ".";
+		}
+	}
+	print $fh "</table>";
+	print ".\n";
+}#if(enableRRD)
+
+	print $fh "<p class=\"about\">FilerInspector v1.1 by Nicolas Limage</p>\n";
+	print $fh <<EOT
+</div>
+</body>
+</html>
+EOT
+	;
+}
+
+sub print_html_summary
+{
+	# FileHandle
+	my $fh = shift or die;
+	# FilerInfoList
+	my $flist = shift or die;
+	# FilerInfoHash
+	my $fiset = shift or die;
+	my $tidx;
+
+	print $fh <<EOT
+<?xml version="1.0" encoding="iso-8859-1" ?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"
+ "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="fr">
+<head><title>FilerInspector Summary</title>
+<meta http-equiv="Content-Type" content="text/HTML; charset=iso-8859-1" />
+EOT
+	;
+
+	if ($OPTS->{htmlAutoRefresh} > 0)
+	{
+		printf $fh "<meta http-equiv=\"refresh\" content=\"%s\" />\n",
+			$OPTS->{htmlAutoRefresh};
+	}
+
+	print $fh <<EOT
+<link rel="stylesheet" type="text/css" href="style.css" />
+<link rel="stylesheet" type="text/css" href="print.css" media="print" />
+<link rel="stylesheet" type="text/css" href="style.css" media="all" />
+</head><body><div id="report">
+EOT
+	;
+
+	print $fh "<div id=\"model\">";
+	print $fh "<img src=\"$OPTS->{htmlImagesSubDir}/filerinspector.jpg\" alt=\"FilerInspector\" />";
+	print $fh "</div>";
+
+	print $fh "<div id=\"title\">";
+	print $fh "<h1>FilerInspector Summary</h1>";
+	print $fh "<p>updated: " . date_stamp() . "</p>\n";
+	print $fh "</div>";
+	
+	print $fh "<div id=\"spacer\">&nbsp;</div>\n";
+
+	print $fh "<table class=\"info\" id=\"summary\">\n";
+	print $fh "<tr><th>Name</th>";
+	print $fh "<th class=\"status\">Global</th><th class=\"status\">ASup</th>";
+	print $fh "<th class=\"status\">CPU</th><th class=\"status\">Hard</th>";
+	print $fh "<th class=\"status\">Disks</th><th class=\"status\">Vols</th>";
+	print $fh "</tr>\n";
+
+	$tidx = 0;
+	foreach my $hostname (@$flist)
+	{
+		my $fi = $fiset->{$hostname};
+
+		printf $fh "<tr class=\"r%s\">\n", $tidx++ % 2;
+		print $fh "<td><a href=\"$fi->{hostName}.html\">$fi->{hostName}</a></td>\n";
+
+		## Global
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		($fi->{miscGlobalStatusMessage} =~ /global status is normal/) ? "statusOk" : "statusCrit";
+
+		## AutoSupport
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		($fi->{autosupportStatusMessage} =~ /successfully/) ? "statusOk" : "statusWarn";
+
+		## CPU
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		($fi->{cpuBusyTimePerCent} > $OPTS->{rrdPctCritLevel}) ? "statusCrit" :
+		($fi->{cpuBusyTimePerCent} > $OPTS->{rrdPctWarnLevel}) ? "statusWarn" :
+		"statusOk";
+
+		## Hardware
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		(($fi->{envFailedFanMessage} =~ /no failed fans/) ?
+			(($fi->{envFailedPowerSupplyMessage} =~ /no failed power supplies/) ?
+				"statusOk" : "statusCrit")
+			: "statusCrit");
+
+		## Disks
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		($fi->{diskFailedMessage} =~ /no failed disks/) ? "statusOk" : "statusCrit";
+
+		printf $fh "<td class=\"status\"><div class=\"%s\">&nbsp;</div></td>\n",
+		(time > $fi->{timeStamp} + $OPTS->{outdatedDelay}) ? "statusOutdated" :
+		(($fi->{fsStatusMessage} =~ /All volumes have adequate space/) ? "statusOk" : 
+			(($fi->{fsStatusMessage} =~ / nearly full /) ? "statusWarn" : "statusCrit"));
+
+		print $fh "</tr>\n";
+		print ".";
+	}
+
+	print $fh "</table>\n";
+	print $fh "<p class=\"about\">FilerInspector v1.1 by Nicolas Limage</p>\n";
+	print $fh "</div>\n</body>\n</html>\n";
+}
+
+################################################################################
+## ACTIONS
+
+sub save_filerinfo
+{
+	my $filerinfo = shift or die;
+
+	print "[+] Saving Data from $filerinfo->{hostName}: ";
+
+	store($filerinfo, "$OPTS->{rrdDataDir}/$filerinfo->{hostName}.dat.$$");
+
+	rename "$OPTS->{rrdDataDir}/$filerinfo->{hostName}.dat.$$",
+		"$OPTS->{rrdDataDir}/$filerinfo->{hostName}.dat"
+			or die "unable to rename $OPTS->{rrdDataDir}/$filerinfo->{hostName}.dat.$$: $!";
+
+	print "done\n";
+}
+
+sub load_filerinfo
+{
+	my $hostname = shift or die;
+
+	print "[+] Loading Data for $hostname: ";
+
+	my $filerinfo;
+	$filerinfo = retrieve("$OPTS->{rrdDataDir}/${hostname}.dat");
+
+	die "no valid data for $hostname, please run $0 --update $hostname\n" if !$filerinfo;
+
+	print "done\n";
+	return $filerinfo;
+}
+
+sub check_or_load_filerinfo
+{
+	my $hostname = shift or die;
+
+	return if (defined($finfo->{$hostname}));
+	$finfo->{$hostname} = load_filerinfo($hostname);
+}
+
+sub filer_poll_snmp
+{
+	my $hostname = shift or die;
+	my $mib = shift or die;
+
+	print "[+] Reading Informations from $hostname\n";
+	my $filerinfo = get_filer_info($hostname, $mib);
+
+	# Incomplete informations
+	die if (!$filerinfo);
+
+	## Writing Data File
+	save_filerinfo($filerinfo);
+
+	## Saving info in memory
+	$finfo->{$hostname} = $filerinfo;
+}
+
+sub filer_update_db
+{
+	my $hostname = shift or die;
+
+	## Load data if necessary
+	check_or_load_filerinfo($hostname);
+	my $filerinfo = $finfo->{$hostname};
+
+	print "[+] Feeding Databases\n";
+	rrd_update_dbs($filerinfo);
+}
+
+sub filer_report
+{
+	my $hostname = shift or die;
+
+	## Load data if necessary
+	check_or_load_filerinfo($hostname);
+	my $filerinfo = $finfo->{$hostname};
+
+	print "[+] Generating Report\n";
+
+	my $fh;
+	open $fh, '>', "$OPTS->{htmlRoot}/$filerinfo->{hostName}.html.$$"
+		or die "unable to open $OPTS->{htmlRoot}/$filerinfo->{hostName}.html.$$: $!";
+	print_html_filer_report($fh, $filerinfo);
+	close $fh;
+
+	if (!rename "$OPTS->{htmlRoot}/$filerinfo->{hostName}.html.$$",
+		"$OPTS->{htmlRoot}/$filerinfo->{hostName}.html")
+	{
+		unlink "$OPTS->{htmlRoot}/$filerinfo->{hostName}.html.$$";
+		die "unable to rename $OPTS->{htmlRoot}/$filerinfo->{hostName}.html.$$: $!";
+	}
+}
+
+sub filer_graph
+{
+	my $hostname = shift or die;
+
+	## Load data if necessary
+	check_or_load_filerinfo($hostname);
+	my $filerinfo = $finfo->{$hostname};
+
+	if ($OPTS->{enableRRD} && ($OPTS->{doLargeGraphs} || $OPTS->{doThumbGraphs}))
+	{
+		print "[+] Updating Graphs\n";
+		rrd_update_graphs($filerinfo);
+	}
+}
+
+sub filer_generate_index
+{
+	my $hostlist = shift or die;
+
+	for my $hostname (@$hostlist)
+	{
+		check_or_load_filerinfo($hostname);
+	}
+
+	print "[+] Generating Index";
+	my $fh;
+	open $fh, '>', "$OPTS->{htmlRoot}/index.html.$$"
+		or die "unable to open $OPTS->{htmlRoot}/index.html.$$: $!";
+	print_html_summary($fh, $hostlist, $finfo);
+	close $fh;
+	print "\n";
+
+	if (!rename "$OPTS->{htmlRoot}/index.html.$$",
+		"$OPTS->{htmlRoot}/index.html")
+	{
+		unlink "$OPTS->{htmlRoot}/index.html.$$";
+		die "unable to rename $OPTS->{htmlRoot}/index.html.$$: $!";
+	}
+}
+
+sub usage
+{
+	return "usage: $0 [-h|--help] [-u|--update] [-r|--report] [-l|--graph-large] [-t|--graph-thumb] [-i|--index] <hostname> [<hostname> [...]]\n";
+}
+
+################################################################################
+## MAIN
+
+## TODO
+# mail while nearly full quotas / volumes / aggr -> RSS ?
+# options to disable datafeed/graphgen/reportgen
+# RSS Feed for warnings / alerts
+# nvram battery status ??
+## BUGS?
+# only tree-type quotas are supported for qtrees
+# add conditionnal comments in html to support ie6
+# beware of /vol/mirrors/..
+##
+# ajout de locks sur les fichiers
+
+print "[+] FilerInspector starting (" . date_stamp() . ")\n";
+
+# Options Handling
+while (@ARGV && $ARGV[0] =~ m/^-/)
+{
+	my $arg = shift;
+
+	last if $arg eq '--';
+	if ($arg eq '-u' || $arg eq '--update') { $OPTS->{doUpdate} = 1; }
+	elsif ($arg eq '-r' || $arg eq '--report') { $OPTS->{doReport} = 1; }
+	elsif ($arg eq '-l' || $arg eq '--graph-large') { $OPTS->{doLargeGraphs} = 1; }
+	elsif ($arg eq '-t' || $arg eq '--graph-thumb') { $OPTS->{doThumbGraphs} = 1; }
+	elsif ($arg eq '-i' || $arg eq '--index') { $OPTS->{doIndex} = 1; }
+	elsif ($arg eq '-h' || $arg eq '--help') { die usage(); }
+	else { die "[-] unknown option $arg\n" . usage(); }
+}
+
+# Filer List
+my @hostlist = @ARGV;
+die(usage()) if (scalar(@hostlist) == 0);
+
+my $mib;
+if ($OPTS->{doUpdate})
+{
+	# MIB loading
+	print "[+] Loading MIBs\n";
+	$mib = snmp_prepare_mibs();
+}
+
+foreach my $hostname (@hostlist)
+{
+	eval {
+		$0 = "filerinspector: $hostname";
+		if ($OPTS->{doUpdate})
+		{
+			$0 = "filerinspector: $hostname (polling)";
+			filer_poll_snmp($hostname, $mib);
+			$0 = "filerinspector: $hostname (db update)";
+			filer_update_db($hostname);
+		}
+
+		if ($OPTS->{doReport})
+		{
+			$0 = "filerinspector: $hostname (report)";
+			filer_report($hostname);
+		}
+
+		if ($OPTS->{doLargeGraphs} || $OPTS->{doThumbGraphs})
+		{
+			$0 = "filerinspector: $hostname (graph)";
+			filer_graph($hostname);
+		}
+	};
+	warn $@ if $@;
+}
+
+if ($OPTS->{doIndex})
+{
+	filer_generate_index(\@hostlist);
+}
+
+print "[+] Finished (" . date_stamp() . ")\n";
